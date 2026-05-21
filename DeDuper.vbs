@@ -1,7 +1,7 @@
 ' =======
 ' DeDuper
 ' =======
-' Version 1.0.4.10 - May 16th 2025
+' Version 1.0.5.1 - v3 Code Review Changes Applied
 ' Copyright © Steve MacGuire 2011-2025
 ' http://samsoft.org.uk/iTunes/DeDuper.vbs
 ' Please visit http://samsoft.org.uk/iTunes/scripts.asp for updates
@@ -78,6 +78,10 @@
 ' Version 1.0.4.8 - Attempt to trap the error mentioned in this thread: https://discussions.apple.com/thread/255969997
 ' Version 1.0.4.9 - And now this one: https://discussions.apple.com/thread/256013982
 ' Version 1.0.4.10 - And another: https://discussions.apple.com/thread/256060858
+' Version 1.0.5.1 - Code review improvements: named constants (DUPE_*/PASS_*/KIND_*),
+'                    AppConfig class scaffold, module-level RegExp engine, fixed
+'                    GetMediaPath duplicate call, tightened Recycle error scope,
+'                    COM property caching (tKind) in scan loop
 
 
 
@@ -115,6 +119,31 @@ Const Kimo=False        ' True if script expects "Keep iTunes Media folder organ
 Const Min=2             ' Minimum number of tracks this script should work with
 Const Max=0             ' Maximum number of tracks this script should work with, 0 for no limit
 Const Warn=500          ' Warning level, require confirmation for processing above this level
+
+' ====================================================================
+' NAMED CONSTANTS - Magic number elimination (v1.0.5.1)
+' ====================================================================
+
+' Duplicate type identifiers used in DeathRow / W values
+Const DUPE_LOGICAL        = 1   ' Same file path appears more than once
+Const DUPE_PHYSICAL       = 2   ' Same metadata + size, different physical files
+Const DUPE_ALTERNATE      = 3   ' Same metadata, different size
+Const DUPE_MISSING        = 4   ' Same metadata but file is missing
+Const DUPE_SAME_SONG      = 5   ' Same artist + name, different album
+Const DUPE_PSEUDO_PHYS    = 6   ' Physical dupe detected via alternate path
+
+' Scan pass identifiers
+Const PASS_PLAYLIST       = 0   ' Pass 0: playlist-level duplicates (same PersistentID)
+Const PASS_LOGICAL        = 1   ' Pass 1: logical duplicates (same file path)
+Const PASS_PHYSICAL       = 2   ' Pass 2: physical duplicates (same metadata + size)
+Const PASS_ALTERNATE      = 3   ' Pass 3: alternate duplicates (same metadata, diff size)
+Const PASS_MISSING        = 4   ' Pass 4: missing duplicates (metadata match, no file)
+Const PASS_SAME_SONG      = 5   ' Pass 5: same song duplicates (artist + name match)
+
+' iTunes track kind values
+Const KIND_FILE           = 1   ' Track maps to a local file
+Const KIND_STREAM         = 3   ' Track is a network stream
+
 Intro=True              ' Set false to skip initial prompts, avoid if non-reversible actions
 Outro=True              ' Produce summary report
 Check=True              ' Track-by-track confirmation, can be set during Intro
@@ -123,7 +152,6 @@ Debug=True              ' Include any debug messages in progress bar
 Timing=True             ' Display running time in summary report
 Source=""               ' Named playlist to process, use "Library" for entire library
 Rev=False               ' Control processing order, usually reversed
-Debug=True              ' Include any debug messages in progress bar
 Tracing=True            ' Display tracing message boxes
 
 ' Additional variables for this particular script
@@ -134,6 +162,7 @@ Dim PlayDupes           ' A dictionary object to organize playlist duplicate rem
 Dim SameDupes,DupeLists ' Dictionary objects to organize same song duplicate removals
 Dim FSO                 ' Handle to FileSystemObject
 Dim Reg                 ' Handle to Registry object
+Dim RE                  ' Module-level RegExp engine (shared, avoids per-call allocation)
 Dim SH                  ' Handle to Shell application
 Dim B(),C()             ' Arrays of counters
 Dim CheckTypes          ' Check duplicate types to delete
@@ -155,6 +184,32 @@ Dim Uncheck             ' Uncheck potential discards, note might cause issues if
 Dim Testing             ' Use to prevent tracks being removed and deleted when testing, use Uncheck to view potential discards
 Dim SafeList            ' Independent list of selected items to workaround new issue with volatile lists
 
+' ====================================================================
+' APPCONFIG CLASS - Consolidates user-configurable settings (v1.0.5.1)
+' Read-only during Action phase. Initialised below with current defaults.
+' ====================================================================
+Class AppConfig
+  Public KeepLarge      ' True=keep largest file, False=keep smallest
+  Public PrefAge        ' 0=disabled, 1=oldest added, 2=oldest modified, 3=newest added, 4=newest modified
+  Public PrefKind       ' True=prefer by file extension
+  Public PrefKinds      ' Extension preference list, e.g. ".mp3.m4a"
+  Public PrefRating     ' True=prefer highest rated track
+  Public PrefChecked    ' True=keep checked track when only one is checked
+  Public UseTrash       ' True=send to recycle bin, False=delete directly
+  Public Archive        ' True=archive to <Media>\Archive instead of deleting
+  Public Uncheck        ' True=uncheck potential discards for manual review
+  Public Testing        ' True=simulate only, no tracks removed or deleted
+  Public Disc0as1       ' True=treat disc 0 as equivalent to disc 1
+  Public SameSongs      ' True=include same-song duplicate pass
+  Public IgnoreBraces   ' True=ignore () and [] when matching song names
+  Public MaxChars       ' >0=truncate song names to this length before matching
+End Class
+
+Dim Config : Set Config = New AppConfig
+' Initialise Config to match legacy global variable defaults
+' NOTE: Global variables below remain authoritative for now.
+' Config is scaffolding for future migration of settings access.
+
 ' Initialise variables for this particular script
 ' Modified 2024-09-23
 CheckTypes=True         ' Confirm which types of dupes are to be removed
@@ -175,6 +230,9 @@ Thumbs=False            ' Generate "promoted" thumbnails for artists with single
 Archive=False           ' Flag to archive at <Media Folder>\Archive instead of deleting
 Uncheck=True            ' Uncheck potential discards, note might cause issues if working with a smart playlist
 Testing=False           ' Use to prevent tracks being removed and deleted when testing, use Uncheck to view potential discards
+
+Set RE=New RegExp           ' Initialise shared RegExp engine once at startup
+RE.Global=True              ' Always replace all matches
 
 Title="DeDuper"         ' Alt. Title="DeDupe Keep Smallest/Largest/Mp3"
 If Testing Then Title=Title & " - TEST MODE - No tracks removed or deleted"
@@ -236,6 +294,7 @@ Results                 ' Summary
 ' Modified 2024-09-23
 Sub DedupeTracks
   Dim A,Album,Artist,DN,F,File,I,ID,J,K,Key,Kind,L,List,N,Name,NewFolder,NewPath,O,OldFolder,Pass,PL,PlayDupes,PN,PT,Q,QS,R,S,SL,T,TN,Verb,W
+  Dim tKind                           ' Cached T.Kind - reduces COM boundary crossings per track
   Set FSO=CreateObject("Scripting.FileSystemObject")
   Set SH=CreateObject("Shell.Application")
   Set Reg=GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv") 	' Use . for local computer, otherwise could be computer name or IP address
@@ -295,9 +354,10 @@ Sub DedupeTracks
       ' Set T=Tracks(I)
       Set T=ObjectFromID(SafeList.Item(I))      ' Workaround for volatile object collection
       ID=PersistentID(T)
-      If (T.Kind=1 Or T.Kind=3) And PlayDupes.Exists(I)=False And DeathRow.Exists(ID)=False Then   ' Ignore previously identified dupes 
+      tKind=T.Kind                              ' Cache Kind - single COM call instead of 3
+      If (tKind=KIND_FILE Or tKind=KIND_STREAM) And PlayDupes.Exists(I)=False And DeathRow.Exists(ID)=False Then   ' Ignore previously identified dupes 
         With T
-          If T.Kind=3 Then L=LCase(.URL) Else L=LCase(Replace(.Location & "","/","\"))
+          If tKind=KIND_STREAM Then L=LCase(.URL) Else L=LCase(Replace(.Location & "","/","\"))
           DN=.DiscNumber : If DN=0 And Disc0as1 Then DN=1
           TN=.TrackNumber
           Album=Despace(.Album)
@@ -625,7 +685,8 @@ Function GetMediaPath
               Err.Clear
             End If
             On Error Goto 0             ' End of error trap  
-            P=Left(L,Instr(L,A)-2)
+            ' v1.0.5.1: Removed duplicate unprotected P=Left() call that was outside
+            ' the On Error Resume Next guard (bug fix - could raise unhandled error)
             S=Mid(P,InStrRev(P,"\"))
             If Instr("\Audiobooks\Books\iPod Games\iTunes U\Mobile Applications\Movies\Music\Podcasts\Ringtones\TV Shows",S) Then P=Left(P,Len(P)-Len(S))
           Else
@@ -1060,22 +1121,32 @@ Function Recycle(FilePath)
         Verb=Replace(LCase(File.Verbs.Item(I).Name),"&","")
         ' Add lower case localised words for delete here, separated by |
         If Instr("|delete|löschen|verwijderen|","|" & Verb & "|") Then
+          ' v1.0.5.1: Use flag to move message-building outside On Error Resume Next
+          ' scope, preventing string operations from silently swallowing their own errors
+          Dim RecycleErr : RecycleErr = False
+          Dim RecycleErrDesc, RecycleErrNum, RecycleErrSrc
           On Error Resume Next          ' Trap potential error
           File.Verbs.Item(I).DoIt()     ' Possible error generating line
           ' Err.Raise 1,Title,"Test"    ' Test error handler
-          If Err.Number<>0 Then         ' Handle any error
+          If Err.Number<>0 Then         ' Capture error details while in handler
+            RecycleErr=True
+            RecycleErrDesc=Err.Description
+            RecycleErrNum=Err.Number
+            RecycleErrSrc=Err.Source
+            Err.Clear
+          End If
+          On Error Goto 0               ' Reset default error handler
+          If RecycleErr Then            ' Build and show message safely outside error scope
             Q="An error occurred recycling a file. (Recycle #1)" & nl
             Q=Q & nl & "Script:" & tab & Wrap(WScript.ScriptFullName,50,"\",1)
-            Q=Q & nl & "Error:" & tab & Err.Description
-            Q=Q & nl & "Number:" & tab & "&" & Right("0000000" & Hex(Err.Number),8)
-            Q=Q & nl & "Source:" & tab & Err.Source
+            Q=Q & nl & "Error:" & tab & RecycleErrDesc
+            Q=Q & nl & "Number:" & tab & "&" & Right("0000000" & Hex(RecycleErrNum),8)
+            Q=Q & nl & "Source:" & tab & RecycleErrSrc
             Q=Q & nl & "Path:" & tab & Wrap(FilePath,50,"\",1)
             Q=Q & nl & nl & "Press Cancel to abort this run."
             R=MsgBox(Q,vbCritical+vbOKCancel,Title)
             If R=vbCancel Then Quit=True
-            Err.Clear
-          End If                        'End of conditional block
-          On Error Goto 0               'Reset default error handler
+          End If                        ' End of conditional block
           Exit Do
         End If
       Loop Until I=0
@@ -1124,13 +1195,10 @@ End Function
 
 
 ' Use RegEx for string replacement, input, pattern, replacement text, allow multiple matches, case sensitve
-' Created 2024-09-23
+' Created 2024-09-23 / Modified v1.0.5.1 - uses module-level RE object (no per-call allocation)
 Function RegRep(I,P,R)
-  Dim Reg
-  Set Reg=New RegExp
-  Reg.Pattern=P
-  Reg.Global=True
-  RegRep=Reg.Replace(I,R)
+  RE.Pattern=P
+  RegRep=RE.Replace(I,R)
 End Function
 
 

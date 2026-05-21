@@ -2,6 +2,32 @@
 
 All notable changes to DeDuper are documented in this file.
 
+## [1.0.5.1] - 2026-05-22
+
+### Added
+- **Named constants** — `DUPE_*` (6 types), `PASS_*` (6 scan passes), and `KIND_*` (file/stream) replace
+  all magic numbers throughout the scan logic, making intent self-documenting
+- **AppConfig class** — scaffolding class encapsulates all user-configurable settings
+  (`KeepLarge`, `PrefAge`, `PrefKind`, `UseTrash`, `Testing`, `Disc0as1`, etc.) in one place;
+  global variables remain authoritative for now pending full migration
+- **Module-level RegExp engine** — single `RE` object initialised at startup; eliminates a new
+  `RegExp` COM object being allocated on every `Despace()` call (called once per track, per pass)
+
+### Fixed
+- **GetMediaPath** — removed duplicate `P=Left(L,Instr(L,A)-2)` assignment that executed
+  *outside* the `On Error Resume Next` guard; on a malformed path this would raise an
+  unhandled runtime error after the guarded attempt had already captured the failure
+- **Recycle (error scope)** — message-building and `MsgBox` call moved outside the
+  `On Error Resume Next` block using a flag variable; previously, string-formatting operations
+  inside the error scope could silently swallow their own errors
+- **Duplicate `Debug=True` assignment** — removed a copy-paste leftover that redundantly
+  re-assigned `Debug=True` six lines after its first assignment
+
+### Changed
+- **DedupeTracks scan loop** — `T.Kind` is now read once into `tKind` before the inner `With T`
+  block, reducing the loop from three COM boundary crossings per track (for `Kind`) to one;
+  magic literals `1` and `3` replaced with `KIND_FILE` and `KIND_STREAM` constants
+
 ## [1.0.4.10] - 2025-05-16
 
 ### Fixed
